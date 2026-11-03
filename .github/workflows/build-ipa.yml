@@ -29,9 +29,78 @@ jobs:
           PROJECT_DIR=$(dirname "$SOURCE_DIR")
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
-      - name: 3. 自动修复 project.yml 并生成兼容格式 Xcode 工程
+      - name: 3. 自动修复 Swift 源码与 project.yml 并生成工程
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
+          python3 - << 'PYEOF'
+          import glob, re
+
+          swift_files = glob.glob("LivePrompter/**/*.swift", recursive=True)
+          has_labeled_hex = False
+
+          for path in swift_files:
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+              orig = content
+
+              # 1. 移除 Color 扩展上的 private/fileprivate 限制，并把可失败初始化 init?(hex:) 转为非可选 init(hex:)
+              content = re.sub(r'\b(fileprivate|private)\s+extension\s+Color\b', 'extension Color', content)
+              content = re.sub(r'\b(fileprivate|private)\s+init\s*\??\s*\(\s*hex\s*:', 'init(hex:', content)
+              content = re.sub(r'\binit\?\s*\(\s*hex\s*:\s*String\s*\)', 'init(hex: String)', content)
+
+              if re.search(r'\binit\s*\(\s*hex\s*:\s*String\s*\)', content):
+                  has_labeled_hex = True
+
+              # 2. 修复 PiPManager.swift 中 AVPictureInPictureSampleBufferPlaybackDelegate 的 skipByInterval 函数签名
+              content = re.sub(
+                  r'func\s+pictureInPictureController\s*\([^{]*skipByInterval[^{]*\{',
+                  'func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {\n        let completion = completionHandler',
+                  content
+              )
+
+              if content != orig:
+                  print(f"已自动修复源码文件: {path}")
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(content)
+
+          # 3. 如果工程中缺少带 hex: 标签的 Color(hex: String) 扩展，自动补充到 AppSettings.swift
+          if not has_labeled_hex:
+              target_file = "LivePrompter/Models/AppSettings.swift"
+              color_ext = """
+
+          import SwiftUI
+
+          extension Color {
+              init(hex: String) {
+                  let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+                  var int: UInt64 = 0
+                  Scanner(string: hex).scanHexInt64(&int)
+                  let a, r, g, b: UInt64
+                  switch hex.count {
+                  case 3:
+                      (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+                  case 6:
+                      (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+                  case 8:
+                      (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+                  default:
+                      (a, r, g, b) = (255, 255, 255, 255)
+                  }
+                  self.init(
+                      .sRGB,
+                      red: Double(r) / 255,
+                      green: Double(g) / 255,
+                      blue: Double(b) / 255,
+                      opacity: Double(a) / 255
+                  )
+              }
+          }
+          """
+              with open(target_file, "a", encoding="utf-8") as f:
+                  f.write(color_ext)
+              print(f"已向 {target_file} 自动注入 Color(hex: String) 扩展")
+          PYEOF
+
           cat << 'EOF' > project.yml
           name: LivePrompter
           options:
@@ -70,6 +139,7 @@ jobs:
                     - UIInterfaceOrientationLandscapeRight
               settings:
                 base:
+                  SWIFT_VERSION: "5.0"
                   PRODUCT_BUNDLE_IDENTIFIER: com.liveprompter.app
                   MARKETING_VERSION: 1.0.0
                   CURRENT_PROJECT_VERSION: 1
@@ -84,19 +154,17 @@ jobs:
             brew install xcodegen
           fi
           xcodegen generate
-          # 强制将工程文件格式版本从 77 转换为兼容的 56，防止 Xcode 15.4 无法读取
           sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' LivePrompter.xcodeproj/project.pbxproj
 
       - name: 4. 使用云端 Xcode 编译 iOS 应用 (免证书模式)
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          # 如果云端环境预装了 Xcode 16，优先切换至最新 Xcode
           if ls -d /Applications/Xcode_16*.app >/dev/null 2>&1; then
             LATEST_XCODE=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)
-            echo "切换至 $LATEST_XCODE"
             sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
           fi
 
+          set +e
           xcodebuild clean build \
             -project LivePrompter.xcodeproj \
             -scheme LivePrompter \
@@ -106,7 +174,15 @@ jobs:
             DEVELOPMENT_TEAM="" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ $BUILD_STATUS -ne 0 ]; then
+            echo "========== 编译错误汇总 =========="
+            grep -n -C 2 "error:" build.log || true
+            exit $BUILD_STATUS
+          fi
 
       - name: 5. 封装打包成标准 .ipa 安装包
         working-directory: ${{ env.PROJECT_DIR }}
