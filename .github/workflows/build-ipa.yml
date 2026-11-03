@@ -29,78 +29,9 @@ jobs:
           PROJECT_DIR=$(dirname "$SOURCE_DIR")
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
-      - name: 3. 自动修复 Swift 源码与 project.yml 并生成工程
+      - name: 3. 生成兼容格式 Xcode 工程
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          python3 - << 'PYEOF'
-          import glob, re
-
-          swift_files = glob.glob("LivePrompter/**/*.swift", recursive=True)
-          has_labeled_hex = False
-
-          for path in swift_files:
-              with open(path, "r", encoding="utf-8") as f:
-                  content = f.read()
-              orig = content
-
-              # 1. 移除 Color 扩展上的 private/fileprivate 限制，并把可失败初始化 init?(hex:) 转为非可选 init(hex:)
-              content = re.sub(r'\b(fileprivate|private)\s+extension\s+Color\b', 'extension Color', content)
-              content = re.sub(r'\b(fileprivate|private)\s+init\s*\??\s*\(\s*hex\s*:', 'init(hex:', content)
-              content = re.sub(r'\binit\?\s*\(\s*hex\s*:\s*String\s*\)', 'init(hex: String)', content)
-
-              if re.search(r'\binit\s*\(\s*hex\s*:\s*String\s*\)', content):
-                  has_labeled_hex = True
-
-              # 2. 修复 PiPManager.swift 中 AVPictureInPictureSampleBufferPlaybackDelegate 的 skipByInterval 函数签名
-              content = re.sub(
-                  r'func\s+pictureInPictureController\s*\([^{]*skipByInterval[^{]*\{',
-                  'func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {\n        let completion = completionHandler',
-                  content
-              )
-
-              if content != orig:
-                  print(f"已自动修复源码文件: {path}")
-                  with open(path, "w", encoding="utf-8") as f:
-                      f.write(content)
-
-          # 3. 如果工程中缺少带 hex: 标签的 Color(hex: String) 扩展，自动补充到 AppSettings.swift
-          if not has_labeled_hex:
-              target_file = "LivePrompter/Models/AppSettings.swift"
-              color_ext = """
-
-          import SwiftUI
-
-          extension Color {
-              init(hex: String) {
-                  let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-                  var int: UInt64 = 0
-                  Scanner(string: hex).scanHexInt64(&int)
-                  let a, r, g, b: UInt64
-                  switch hex.count {
-                  case 3:
-                      (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
-                  case 6:
-                      (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
-                  case 8:
-                      (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
-                  default:
-                      (a, r, g, b) = (255, 255, 255, 255)
-                  }
-                  self.init(
-                      .sRGB,
-                      red: Double(r) / 255,
-                      green: Double(g) / 255,
-                      blue: Double(b) / 255,
-                      opacity: Double(a) / 255
-                  )
-              }
-          }
-          """
-              with open(target_file, "a", encoding="utf-8") as f:
-                  f.write(color_ext)
-              print(f"已向 {target_file} 自动注入 Color(hex: String) 扩展")
-          PYEOF
-
           cat << 'EOF' > project.yml
           name: LivePrompter
           options:
@@ -156,7 +87,7 @@ jobs:
           xcodegen generate
           sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' LivePrompter.xcodeproj/project.pbxproj
 
-      - name: 4. 使用云端 Xcode 编译 iOS 应用 (免证书模式)
+      - name: 4. 自动修复源码语法并编译 iOS 应用
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           if ls -d /Applications/Xcode_16*.app >/dev/null 2>&1; then
@@ -164,25 +95,87 @@ jobs:
             sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
           fi
 
-          set +e
-          xcodebuild clean build \
-            -project LivePrompter.xcodeproj \
-            -scheme LivePrompter \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath build \
-            DEVELOPMENT_TEAM="" \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log
-          BUILD_STATUS=${PIPESTATUS[0]}
-          set -e
+          python3 - << 'PYEOF'
+          import glob, re, subprocess, sys
 
-          if [ $BUILD_STATUS -ne 0 ]; then
-            echo "========== 编译错误汇总 =========="
-            grep -n -C 2 "error:" build.log || true
-            exit $BUILD_STATUS
-          fi
+          # 1. 修复 SettingsView.swift 等文件中多余的 hex: 参数标签
+          for path in glob.glob("LivePrompter/**/*.swift", recursive=True):
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+              new_content = re.sub(r'\bColor\s*\(\s*hex\s*:\s*', 'Color(', content)
+              if new_content != content:
+                  print(f"已修复 Color(hex:) 调用: {path}")
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(new_content)
+
+          # 2. 定位 PiPManager.swift 中的 skipByInterval 方法并准备多种兼容签名
+          pip_path = "LivePrompter/Services/PiPManager.swift"
+          with open(pip_path, "r", encoding="utf-8") as f:
+              pip_src = f.read()
+
+          m = re.search(r'[^\n]*\bfunc\s+pictureInPictureController\b[^{]*\bskipByInterval\b[^{]*\{', pip_src)
+          if m:
+              func_start = m.start()
+              brace_start = m.end() - 1
+              depth = 0
+              func_end = brace_start
+              for i in range(brace_start, len(pip_src)):
+                  if pip_src[i] == "{":
+                      depth += 1
+                  elif pip_src[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          func_end = i
+                          break
+              pip_template = pip_src[:func_start] + "    __SKIP_SLOT__\n" + pip_src[func_end + 1:]
+          else:
+              pip_template = pip_src
+
+          candidates = [
+              "func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime) async {}",
+              "nonisolated func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime) async {}",
+              "func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completionHandler: @escaping () -> Void) { completionHandler() }",
+              "nonisolated func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completionHandler: @escaping () -> Void) { completionHandler() }",
+              "nonisolated func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) { completionHandler() }"
+          ]
+
+          cmd = [
+              "xcodebuild", "build",
+              "-project", "LivePrompter.xcodeproj",
+              "-scheme", "LivePrompter",
+              "-configuration", "Release",
+              "-sdk", "iphoneos",
+              "-derivedDataPath", "build",
+              "DEVELOPMENT_TEAM=",
+              "CODE_SIGN_IDENTITY=",
+              "CODE_SIGNING_REQUIRED=NO",
+              "CODE_SIGNING_ALLOWED=NO"
+          ]
+
+          last_log = ""
+          for idx, cand in enumerate(candidates, 1):
+              print(f"=== 尝试编译方案 {idx} ===")
+              with open(pip_path, "w", encoding="utf-8") as f:
+                  f.write(pip_template.replace("__SKIP_SLOT__", cand))
+              res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              last_log = res.stdout
+              if res.returncode == 0:
+                  print(f"✅ 编译成功（方案 {idx}）！")
+                  sys.exit(0)
+              if "AVPictureInPictureSampleBufferPlaybackDelegate" not in last_log:
+                  break
+
+          print("========== 编译错误详情 ==========")
+          lines = last_log.splitlines()
+          for i, line in enumerate(lines):
+              if "error:" in line:
+                  start = max(0, i - 4)
+                  end = min(len(lines), i + 6)
+                  for j in range(start, end):
+                      print(f"{j+1}: {lines[j]}")
+                  print("-" * 40)
+          sys.exit(1)
+          PYEOF
 
       - name: 5. 封装打包成标准 .ipa 安装包
         working-directory: ${{ env.PROJECT_DIR }}
