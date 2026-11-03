@@ -1,0 +1,68 @@
+name: Build iOS IPA on Cloud Mac
+
+on:
+  # 支持代码上传时自动触发，也支持在浏览器里手动点击按钮触发
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-14 # 调用 GitHub 提供的云端 macOS 虚拟机
+
+    steps:
+      - name: 1. 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 检查并兼容直接上传的 ZIP 压缩包
+        run: |
+          if [ ! -f "project.yml" ]; then
+            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+            if [ -n "$ZIP_FILE" ]; then
+              echo "检测到 ZIP 压缩包: $ZIP_FILE，正在自动解压..."
+              unzip -o "$ZIP_FILE"
+            fi
+          fi
+          # 如果解压后多套了一层目录，自动进入包含 project.yml 的目录
+          PROJECT_DIR=$(dirname $(find . -name "project.yml" | head -n 1))
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: 3. 使用 XcodeGen 生成 Xcode 工程
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: 4. 使用云端 Xcode 编译 iOS 应用 (免证书模式)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          xcodebuild clean build \
+            -project LivePrompter.xcodeproj \
+            -scheme LivePrompter \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: 5. 封装打包成标准 .ipa 安装包
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find build -name "LivePrompter.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "未找到编译产物 LivePrompter.app"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
+          zip -r -q LivePrompter.ipa Payload
+
+      - name: 6. 上传 .ipa 供浏览器直接下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: LivePrompter-iOS-IPA
+          path: ${{ env.PROJECT_DIR }}/LivePrompter.ipa
